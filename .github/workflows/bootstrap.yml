@@ -1,0 +1,53 @@
+name: Import HauHau Stack source
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.bootstrap/**'
+      - '.github/workflows/bootstrap.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hauhau-bootstrap-main
+  cancel-in-progress: false
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Reassemble and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/part* | base64 --decode > /tmp/hauhau-stack.zip
+          unzip -t /tmp/hauhau-stack.zip
+          rm -rf /tmp/hauhau-stack-source
+          mkdir -p /tmp/hauhau-stack-source
+          unzip -oq /tmp/hauhau-stack.zip -d /tmp/hauhau-stack-source
+          test -f /tmp/hauhau-stack-source/install.ps1
+          test -f /tmp/hauhau-stack-source/hauhau-voice-stack.ps1
+          test -f /tmp/hauhau-stack-source/voice_proxy.py
+          test -f /tmp/hauhau-stack-source/VERSION.txt
+
+      - name: Import directly onto main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a /tmp/hauhau-stack-source/. .
+          rm -rf .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import HauHau Stack v3.0.4 [skip ci]"
+          git push origin HEAD:main
