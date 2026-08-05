@@ -47,12 +47,15 @@ jobs:
           base64 --decode /tmp/hauhau-v3.1.0.tar.gz.b64 > /tmp/hauhau-v3.1.0.tar.gz
           echo '9889635e82f35fdbe03b0424beaf6eaa9d5d9357be7d80ff2071dd609f0cb2a7  /tmp/hauhau-v3.1.0.tar.gz' | sha256sum --check
 
-          mapfile -t members < <(tar -tzf /tmp/hauhau-v3.1.0.tar.gz)
-          expected=(README.md VERSION.txt config.example.ps1 install.ps1 hauhau-voice-stack.ps1)
-          if [[ "${members[*]}" != "${expected[*]}" ]]; then
-            printf 'Unexpected payload members:\n%s\n' "${members[*]}" >&2
-            exit 1
-          fi
+          tar -tzf /tmp/hauhau-v3.1.0.tar.gz | tr -d '\r' > /tmp/payload-members.txt
+          printf '%s\n' \
+            README.md \
+            VERSION.txt \
+            config.example.ps1 \
+            install.ps1 \
+            hauhau-voice-stack.ps1 \
+            > /tmp/expected-members.txt
+          diff -u /tmp/expected-members.txt /tmp/payload-members.txt
           tar -xzf /tmp/hauhau-v3.1.0.tar.gz
 
       - name: Parse and validate upgraded source
