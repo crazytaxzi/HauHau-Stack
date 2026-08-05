@@ -1,0 +1,294 @@
+name: Verify and publish release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hauhau-release
+  cancel-in-progress: false
+
+jobs:
+  verify-package-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify committed source
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $files = @(
+            'README.md',
+            'install.ps1',
+            'REPAIR_HAUHAU.cmd',
+            'INSTALL_CUDA.cmd',
+            'voice_proxy.py',
+            'uninstall.ps1',
+            'INSTALL_DEFER_TTS.cmd',
+            'hauhau-voice-stack.ps1',
+            'hauhau-voice-stack.cmd',
+            'config.example.ps1',
+            'CHECK_HAUHAU.cmd',
+            'INSTALL.cmd',
+            'STOP_HAUHAU.cmd',
+            'START_HAUHAU.cmd',
+            'VERSION.txt'
+          )
+
+          foreach ($file in $files) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Required release file is missing: $file"
+            }
+          }
+
+          $versionText = Get-Content -LiteralPath 'VERSION.txt' -Raw
+          if ($versionText -notmatch 'Installer version:\s*([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw 'VERSION.txt does not contain an installer version.'
+          }
+
+          $version = $Matches[1]
+          if ($version -ne '3.0.4') {
+            throw "This first-release workflow expects version 3.0.4, found $version."
+          }
+
+          foreach ($script in @('install.ps1', 'hauhau-voice-stack.ps1', 'config.example.ps1', 'uninstall.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $script),
+              [ref] $tokens,
+              [ref] $parseErrors
+            ) | Out-Null
+
+            if (@($parseErrors).Count -gt 0) {
+              $details = @($parseErrors | ForEach-Object { $_.Message }) -join '; '
+              throw "PowerShell parser rejected ${script}: $details"
+            }
+          }
+
+          python -m py_compile voice_proxy.py
+          if ($LASTEXITCODE -ne 0) {
+            throw 'voice_proxy.py failed Python compilation.'
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip=hauhau_voice_stack_windows_installer_v$version.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksum=hauhau_voice_stack_windows_installer_v$version.zip.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Package and verify installer
+        shell: pwsh
+        env:
+          RELEASE_ZIP: ${{ steps.meta.outputs.zip }}
+          RELEASE_CHECKSUM: ${{ steps.meta.outputs.checksum }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          @'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          files = [
+              'README.md',
+              'install.ps1',
+              'REPAIR_HAUHAU.cmd',
+              'INSTALL_CUDA.cmd',
+              'voice_proxy.py',
+              'uninstall.ps1',
+              'INSTALL_DEFER_TTS.cmd',
+              'hauhau-voice-stack.ps1',
+              'hauhau-voice-stack.cmd',
+              'config.example.ps1',
+              'CHECK_HAUHAU.cmd',
+              'INSTALL.cmd',
+              'STOP_HAUHAU.cmd',
+              'START_HAUHAU.cmd',
+              'VERSION.txt',
+          ]
+
+          zip_name = os.environ['RELEASE_ZIP']
+          checksum_name = os.environ['RELEASE_CHECKSUM']
+          commit = os.environ['GITHUB_SHA']
+
+          for name in files:
+              if not pathlib.Path(name).is_file():
+                  raise SystemExit(f'missing package member: {name}')
+
+          with zipfile.ZipFile(
+              zip_name,
+              mode='w',
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+          ) as archive:
+              for name in files:
+                  archive.write(name, arcname=name)
+
+          with zipfile.ZipFile(zip_name, mode='r') as archive:
+              names = archive.namelist()
+              if names != files:
+                  raise SystemExit(f'archive member mismatch: {names!r}')
+              bad_member = archive.testzip()
+              if bad_member is not None:
+                  raise SystemExit(f'archive CRC failed: {bad_member}')
+
+              for name in files:
+                  packaged = archive.read(name)
+                  working_tree = pathlib.Path(name).read_bytes()
+                  committed = subprocess.check_output(
+                      ['git', 'show', f'{commit}:{name}']
+                  )
+                  if packaged != working_tree:
+                      raise SystemExit(f'package differs from working tree: {name}')
+                  if packaged != committed:
+                      raise SystemExit(f'package differs from commit {commit}: {name}')
+
+          digest = hashlib.sha256(pathlib.Path(zip_name).read_bytes()).hexdigest()
+          pathlib.Path(checksum_name).write_text(
+              f'{digest}  {zip_name}\n',
+              encoding='ascii',
+              newline='\n',
+          )
+          print(f'SHA256={digest}')
+          '@ | Set-Content -LiteralPath '.release_package.py' -Encoding utf8
+
+          python .release_package.py
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release package verification failed.'
+          }
+
+          $checksumLine = Get-Content -LiteralPath $env:RELEASE_CHECKSUM -Raw
+          $expectedHash = ($checksumLine -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $env:RELEASE_ZIP -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Generated checksum mismatch: expected $expectedHash, got $actualHash"
+          }
+
+      - name: Confirm this is the first release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $existing = @(gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json)
+          if ($existing.Count -ne 0) {
+            $names = @($existing | ForEach-Object { $_.tag_name }) -join ', '
+            throw "Repository already has releases: $names"
+          }
+
+      - name: Publish v3.0.4
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_ZIP: ${{ steps.meta.outputs.zip }}
+          RELEASE_CHECKSUM: ${{ steps.meta.outputs.checksum }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          @"
+          # HauHau Automatic Voice Stack $env:RELEASE_TAG
+
+          First public Windows release of the HauHau local voice stack.
+
+          ## Included
+
+          - Automatic NVIDIA CUDA detection, including RTX 4070 systems
+          - Dependency checks and retrieval for Python, llama.cpp, CrispASR, and VC++ runtime
+          - Qwen3-TTS model downloads through curl with retry and resume support
+          - Explicit local TTS model paths after installation
+          - Corrected CrispASR dependency doctor validation
+          - Start, stop, repair, status, logs, test, and uninstall commands
+          - OpenAI-compatible LLM-to-TTS voice proxy
+
+          ## Compatibility
+
+          - Installer: $env:RELEASE_VERSION
+          - CrispASR: v0.8.25
+          - llama.cpp: b10280
+          - Windows x64
+
+          Download the installer ZIP and verify it with the accompanying SHA-256 file before extraction.
+          "@ | Set-Content -LiteralPath 'release-notes.md' -Encoding utf8
+
+          gh release create `
+            $env:RELEASE_TAG `
+            $env:RELEASE_ZIP `
+            $env:RELEASE_CHECKSUM `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "HauHau Stack $env:RELEASE_TAG" `
+            --notes-file 'release-notes.md' `
+            --latest
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub release creation failed.'
+          }
+
+      - name: Verify published release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_ZIP: ${{ steps.meta.outputs.zip }}
+          RELEASE_CHECKSUM: ${{ steps.meta.outputs.checksum }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease,assets,url | ConvertFrom-Json
+          if ($release.tagName -ne $env:RELEASE_TAG) {
+            throw "Published tag mismatch: $($release.tagName)"
+          }
+          if ($release.isDraft -or $release.isPrerelease) {
+            throw 'The first release was unexpectedly published as a draft or prerelease.'
+          }
+
+          $assetNames = @($release.assets | ForEach-Object { $_.name })
+          foreach ($required in @($env:RELEASE_ZIP, $env:RELEASE_CHECKSUM)) {
+            if ($required -notin $assetNames) {
+              throw "Published release is missing asset: $required"
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path 'release-verify' | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $env:RELEASE_ZIP `
+            --pattern $env:RELEASE_CHECKSUM `
+            --dir 'release-verify'
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not download the newly published release assets.'
+          }
+
+          $localHash = (Get-FileHash -LiteralPath $env:RELEASE_ZIP -Algorithm SHA256).Hash.ToLowerInvariant()
+          $publishedHash = (Get-FileHash -LiteralPath (Join-Path 'release-verify' $env:RELEASE_ZIP) -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($localHash -ne $publishedHash) {
+            throw "Uploaded ZIP changed in transit: local $localHash, published $publishedHash"
+          }
+
+          $localChecksum = Get-Content -LiteralPath $env:RELEASE_CHECKSUM -Raw
+          $publishedChecksum = Get-Content -LiteralPath (Join-Path 'release-verify' $env:RELEASE_CHECKSUM) -Raw
+          if ($localChecksum -ne $publishedChecksum) {
+            throw 'Published checksum file differs from the verified local checksum file.'
+          }
+
+          "## Release verified`n`n- Tag: $env:RELEASE_TAG`n- ZIP SHA-256: $localHash`n- Assets: $($assetNames -join ', ')`n- URL: $($release.url)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
