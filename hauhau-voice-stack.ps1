@@ -29,6 +29,8 @@ $ProxyErrorLog = Join-Path $StateDir 'proxy.error.log'
 $TtsLog = Join-Path $StateDir 'tts.log'
 $TtsErrorLog = Join-Path $StateDir 'tts.error.log'
 $TtsPidFile = Join-Path $StateDir 'tts.pid'
+$DefaultLlmModelName = 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
+$ExpectedLlamaBuild = 10280
 
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 
@@ -36,6 +38,9 @@ if (-not (Test-Path -LiteralPath $ConfigFile)) {
     throw "Missing config: $ConfigFile`nRun install.ps1 again."
 }
 . $ConfigFile
+
+$ExpectedLlmModelName = if (Get-Variable -Name LLM_EXPECTED_MODEL_NAME -ErrorAction SilentlyContinue) { [string]$LLM_EXPECTED_MODEL_NAME } else { $DefaultLlmModelName }
+$ExpectedLlmModelMinimumBytes = if (Get-Variable -Name LLM_EXPECTED_MODEL_MINIMUM_BYTES -ErrorAction SilentlyContinue) { [long]$LLM_EXPECTED_MODEL_MINIMUM_BYTES } else { 5GB }
 
 $PublicUrl = if (Get-Variable -Name PUBLIC_URL -ErrorAction SilentlyContinue) { $PUBLIC_URL } else { 'http://127.0.0.1:8080' }
 $BackendUrl = if (Get-Variable -Name BACKEND_URL -ErrorAction SilentlyContinue) { $BACKEND_URL } else { 'http://127.0.0.1:8082' }
@@ -341,16 +346,36 @@ function Resolve-ConfiguredExecutablePath {
     return ''
 }
 
-function Test-NativeExecutable {
+function Get-LlamaBuildNumber {
+    param([Parameter(Mandatory)][string]$Executable)
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return 0 }
+    try {
+        $output = (& $Executable --version 2>&1 | Out-String)
+        foreach ($pattern in @('(?im)version\s*:\s*b?(\d+)', '(?im)build(?: number)?\s*:\s*b?(\d+)', '(?im)\bb(\d{4,})\b')) {
+            $match = [regex]::Match($output, $pattern)
+            if ($match.Success) { return [int]$match.Groups[1].Value }
+        }
+    } catch {
+        return 0
+    }
+    return 0
+}
+
+function Test-LlamaServerExecutable {
     param([AllowEmptyString()][string]$CommandLine)
     $exe = Resolve-ConfiguredExecutablePath -CommandLine $CommandLine
     if ([string]::IsNullOrWhiteSpace($exe)) { return $false }
-    try {
-        & $exe --help 1>$null 2>$null
-        return $LASTEXITCODE -eq 0
-    } catch {
-        return $false
+
+    $build = Get-LlamaBuildNumber -Executable $exe
+    if ($build -ge $ExpectedLlamaBuild) { return $true }
+
+    $managedRoot = Join-Path $InstallDir 'runtime\llama.cpp'
+    $marker = Join-Path $managedRoot 'hauhau-build.txt'
+    if (([IO.Path]::GetFullPath($exe)).StartsWith(([IO.Path]::GetFullPath($managedRoot)), [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $marker)) {
+        return (Get-Content -LiteralPath $marker -Raw).Trim() -eq ('b' + $ExpectedLlamaBuild)
     }
+    return $false
 }
 
 function Test-CrispAsrExecutable {
@@ -430,13 +455,15 @@ function Invoke-Doctor {
     if (-not $pythonReady) { $failed = $true }
 
     $llmExe = Get-ConfiguredExecutable -CommandLine ([string]$LLM_COMMAND_LINE)
-    $llmReady = (Test-ConfiguredExecutable -CommandLine ([string]$LLM_COMMAND_LINE)) -and (Test-NativeExecutable -CommandLine ([string]$LLM_COMMAND_LINE))
+    $llmReady = (Test-ConfiguredExecutable -CommandLine ([string]$LLM_COMMAND_LINE)) -and (Test-LlamaServerExecutable -CommandLine ([string]$LLM_COMMAND_LINE))
     Write-DoctorLine -Label 'llama-server.exe' -Passed $llmReady -Detail $llmExe
     if (-not $llmReady) { $failed = $true }
 
     $model = Get-ConfiguredModel -CommandLine ([string]$LLM_COMMAND_LINE)
-    $modelReady = Test-GgufFile -Path $model
-    Write-DoctorLine -Label 'HauHau GGUF model' -Passed $modelReady -Detail $model
+    $modelReady = (Test-GgufFile -Path $model -MinimumBytes $ExpectedLlmModelMinimumBytes) -and
+        ([IO.Path]::GetFileName($model) -ieq $ExpectedLlmModelName)
+    $modelLabel = if ($ExpectedLlmModelName -ieq $DefaultLlmModelName) { 'HauHauCS 9B model' } else { 'Configured GGUF model' }
+    Write-DoctorLine -Label $modelLabel -Passed $modelReady -Detail $model
     if (-not $modelReady) { $failed = $true }
 
     $ttsExe = Get-ConfiguredExecutable -CommandLine ([string]$TTS_START_COMMAND_LINE)

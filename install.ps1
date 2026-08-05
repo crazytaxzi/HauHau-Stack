@@ -19,6 +19,7 @@ $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = Join-Path $env:LOCALAPPDATA 'HauHauVoiceStack'
 $RuntimeDir = Join-Path $InstallDir 'runtime'
 $CrispCacheDir = Join-Path $InstallDir 'models\crispasr'
+$LlmModelDir = Join-Path $InstallDir 'models\llm'
 $DownloadDir = Join-Path $InstallDir 'downloads'
 $StateDir = Join-Path $InstallDir 'state'
 $ConfigFile = Join-Path $InstallDir 'config.ps1'
@@ -26,6 +27,11 @@ $InstallLog = Join-Path $StateDir 'install.log'
 $TtsPreloadLog = Join-Path $StateDir 'tts-preload.log'
 $CrispAsrReleaseTag = 'v0.8.25'
 $LlamaCppReleaseTag = 'b10280'
+$LlmModelName = 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
+$LlmModelUrl = 'https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf?download=true'
+$LlmModelSha256 = '2ca636d9e81d3d23ca9b60c234fe185d30ec082eeba69ce770fdb0c76559a4f5'
+$LlmModelMinimumBytes = 5GB
+$ManagedLlmModelPath = Join-Path $LlmModelDir $LlmModelName
 $TtsTalkerName = 'qwen3-tts-12hz-0.6b-base-q8_0.gguf'
 $TtsCodecName = 'qwen3-tts-tokenizer-12hz.gguf'
 $TtsVoiceName = 'qwen3-tts-voice-default.gguf'
@@ -37,12 +43,12 @@ $TtsCodecPath = Join-Path $CrispCacheDir $TtsCodecName
 $TtsVoicePath = Join-Path $CrispCacheDir $TtsVoiceName
 $script:TtsModelsPreloaded = $false
 $GitHubHeaders = @{
-    'User-Agent' = 'HauHauVoiceStackInstaller/3.0.4'
+    'User-Agent' = 'HauHauVoiceStackInstaller/3.1.0'
     'Accept' = 'application/vnd.github+json'
     'X-GitHub-Api-Version' = '2022-11-28'
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir, $RuntimeDir, $CrispCacheDir, $DownloadDir, $StateDir | Out-Null
+New-Item -ItemType Directory -Force -Path $InstallDir, $RuntimeDir, $CrispCacheDir, $LlmModelDir, $DownloadDir, $StateDir | Out-Null
 Start-Transcript -LiteralPath $InstallLog -Append | Out-Null
 
 function Write-Step {
@@ -132,6 +138,27 @@ function Test-GgufFile {
     }
 }
 
+function Test-FileSha256 {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedSha256
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        return $actual -eq $ExpectedSha256.ToLowerInvariant().Replace('sha256:', '')
+    } catch {
+        return $false
+    }
+}
+
+function Test-HauHau9BModel {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-GgufFile -Path $Path -MinimumBytes $LlmModelMinimumBytes)) { return $false }
+    if ([IO.Path]::GetFileName($Path) -ine $LlmModelName) { return $false }
+    return Test-FileSha256 -Path $Path -ExpectedSha256 $LlmModelSha256
+}
+
 function ConvertTo-NativeArgumentList {
     param([Parameter(Mandatory)][string[]]$Arguments)
     return @($Arguments | ForEach-Object {
@@ -215,6 +242,122 @@ function Invoke-CurlDownload {
 
     Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
     throw "curl.exe could not retrieve a valid GGUF file from $Url"
+}
+
+function Invoke-VerifiedGgufDownload {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [long]$MinimumBytes = 1024
+    )
+
+    if (Test-GgufFile -Path $Destination -MinimumBytes $MinimumBytes) {
+        Write-Host ('Verifying SHA-256: {0}' -f (Split-Path -Leaf $Destination))
+        if (Test-FileSha256 -Path $Destination -ExpectedSha256 $ExpectedSha256) {
+            Write-Host ('Already downloaded and verified: {0}' -f (Split-Path -Leaf $Destination)) -ForegroundColor Green
+            return
+        }
+        Write-Warning 'The existing model file failed SHA-256 verification and will be replaced.'
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    }
+
+    $partial = "$Destination.partial"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
+
+    if (Test-GgufFile -Path $partial -MinimumBytes $MinimumBytes) {
+        Write-Host ('Checking completed partial model: {0}' -f (Split-Path -Leaf $partial))
+        if (Test-FileSha256 -Path $partial -ExpectedSha256 $ExpectedSha256) {
+            Move-Item -LiteralPath $partial -Destination $Destination -Force
+            Write-Host ('Recovered and verified completed download: {0}' -f (Split-Path -Leaf $Destination)) -ForegroundColor Green
+            return
+        }
+    }
+
+    $curlCommand = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curlCommand) {
+        throw 'Windows curl.exe was not found. A current Windows 10/11 curl.exe is required for the HauHauCS 9B model download.'
+    }
+
+    $baseArguments = @(
+        '--location',
+        '--fail',
+        '--show-error',
+        '--http1.1',
+        '--retry', '10',
+        '--retry-delay', '5',
+        '--connect-timeout', '30'
+    )
+
+    foreach ($resume in @($true, $false)) {
+        if (-not $resume) {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+        }
+
+        $arguments = @($baseArguments)
+        if ($resume -and (Test-Path -LiteralPath $partial)) {
+            Write-Host ('Resuming HauHauCS 9B model download: {0}' -f (Split-Path -Leaf $Destination))
+            $arguments += @('--continue-at', '-')
+        } else {
+            Write-Host ('Downloading HauHauCS 9B model: {0}' -f (Split-Path -Leaf $Destination))
+        }
+        $arguments += @('--output', $partial, $Url)
+
+        $process = Start-Process -FilePath ([string]$curlCommand.Source) `
+            -ArgumentList (ConvertTo-NativeArgumentList -Arguments $arguments) `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+
+        if ($process.ExitCode -eq 0 -and (Test-GgufFile -Path $partial -MinimumBytes $MinimumBytes)) {
+            Write-Host 'Download complete. Verifying the official SHA-256; this can take a minute.'
+            if (Test-FileSha256 -Path $partial -ExpectedSha256 $ExpectedSha256) {
+                Move-Item -LiteralPath $partial -Destination $Destination -Force
+                Write-Host ('Downloaded and verified: {0}' -f (Split-Path -Leaf $Destination)) -ForegroundColor Green
+                return
+            }
+            Write-Warning 'The downloaded model failed SHA-256 verification.'
+        }
+
+        if ($resume) {
+            Write-Warning 'The resumed model transfer did not validate. Retrying from zero.'
+        }
+    }
+
+    Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+    throw "curl.exe could not retrieve the verified HauHauCS 9B model from $Url"
+}
+
+function Resolve-DefaultHauHau9BModel {
+    $roots = @(
+        $LlmModelDir,
+        $SourceDir,
+        (Split-Path -Parent $SourceDir),
+        (Join-Path $env:LOCALAPPDATA 'Cinder_Alpha\models'),
+        (Join-Path $env:USERPROFILE 'models'),
+        (Join-Path $env:USERPROFILE 'Downloads')
+    )
+
+    foreach ($root in @($roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
+        $candidate = Get-ChildItem -LiteralPath $root -Filter $LlmModelName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($candidate) {
+            Write-Host "Found the requested HauHauCS 9B model. Verifying SHA-256: $($candidate.FullName)"
+            if (Test-HauHau9BModel -Path $candidate.FullName) {
+                Write-Host "HauHauCS 9B model verified: $($candidate.FullName)" -ForegroundColor Green
+                return $candidate.FullName
+            }
+            Write-Warning "Ignoring an unverified file with the target model name: $($candidate.FullName)"
+        }
+    }
+
+    Write-Host 'The verified HauHauCS Qwen3.5 9B Q4_K_M model was not found locally.'
+    Write-Host 'Downloading approximately 5.63 GB into the HauHau application folder.'
+    Invoke-VerifiedGgufDownload `
+        -Url $LlmModelUrl `
+        -Destination $ManagedLlmModelPath `
+        -ExpectedSha256 $LlmModelSha256 `
+        -MinimumBytes $LlmModelMinimumBytes
+    return $ManagedLlmModelPath
 }
 
 function Get-GitHubRelease {
@@ -312,6 +455,41 @@ function Get-ModelFromCommandLine {
     if (-not $match.Success) { return '' }
     if ($match.Groups[1].Success) { return $match.Groups[1].Value }
     return $match.Groups[2].Value
+}
+
+function Get-LlamaBuildNumber {
+    param([Parameter(Mandatory)][string]$Executable)
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return 0 }
+    try {
+        $output = (& $Executable --version 2>&1 | Out-String)
+        foreach ($pattern in @('(?im)version\s*:\s*b?(\d+)', '(?im)build(?: number)?\s*:\s*b?(\d+)', '(?im)\bb(\d{4,})\b')) {
+            $match = [regex]::Match($output, $pattern)
+            if ($match.Success) { return [int]$match.Groups[1].Value }
+        }
+    } catch {
+        return 0
+    }
+    return 0
+}
+
+function Test-CompatibleLlamaServer {
+    param([Parameter(Mandatory)][string]$Executable)
+    $minimumBuild = [int]$LlamaCppReleaseTag.TrimStart('b')
+    $build = Get-LlamaBuildNumber -Executable $Executable
+    if ($build -ge $minimumBuild) { return $true }
+
+    $managedRoot = Join-Path $RuntimeDir 'llama.cpp'
+    $managedMarker = Join-Path $managedRoot 'hauhau-build.txt'
+    if (([IO.Path]::GetFullPath($Executable)).StartsWith(([IO.Path]::GetFullPath($managedRoot)), [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $managedMarker)) {
+        $markedBuild = (Get-Content -LiteralPath $managedMarker -Raw).Trim()
+        if ($markedBuild -eq $LlamaCppReleaseTag) { return $true }
+    }
+
+    if ([IO.Path]::GetFullPath($Executable) -match ('(?i)llama\.cpp-' + [regex]::Escape($LlamaCppReleaseTag) + '|[\\/]' + [regex]::Escape($LlamaCppReleaseTag) + '[\\/]')) {
+        return $true
+    }
+    return $false
 }
 
 function Test-PythonCommand {
@@ -522,7 +700,9 @@ function Get-GgufScore {
     elseif ($name -match 'hauhau') { $score += 150 }
     if ($name -match 'qwen.?3\.5') { $score += 80 }
     elseif ($name -match 'qwen.?3') { $score += 50 }
-    if ($name -match '4b') { $score += 30 }
+    if ($name -match '9b') { $score += 120 }
+    if ($name -match '27b') { $score -= 120 }
+    if ($name -match '4b') { $score += 20 }
     if ($name -match 'instruct') { $score += 10 }
     if ($name -match 'tts|tokenizer|codec|voice|mmproj|embedding') { $score -= 250 }
     if ($File.Length -gt 500MB) { $score += 5 }
@@ -558,33 +738,7 @@ function Resolve-ModelPath {
         return $resolved
     }
 
-    $roots = @(
-        $SourceDir,
-        (Split-Path -Parent $SourceDir),
-        (Join-Path $env:LOCALAPPDATA 'Cinder_Alpha'),
-        (Join-Path $env:USERPROFILE 'models'),
-        (Join-Path $env:USERPROFILE 'Downloads'),
-        (Join-Path $env:USERPROFILE 'Documents'),
-        (Join-Path $env:USERPROFILE '.cache')
-    )
-    $candidates = @(Find-FileRecursiveLimited -Roots $roots -Filter '*.gguf' | ForEach-Object {
-        [PSCustomObject]@{ File = $_; Score = (Get-GgufScore -File $_) }
-    } | Where-Object { $_.Score -gt -100 } | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.File.LastWriteTime }; Descending = $true })
-
-    $hauhau = @($candidates | Where-Object { $_.Score -ge 150 })
-    if ($hauhau.Count -eq 1) {
-        Write-Host "Found HauHau model: $($hauhau[0].File.FullName)"
-        return $hauhau[0].File.FullName
-    }
-    if ($candidates.Count -gt 0) {
-        Write-Host 'Candidate GGUF models found:'
-        $candidates | Select-Object -First 10 | ForEach-Object { Write-Host ('  {0}' -f $_.File.FullName) }
-    }
-    $initial = if ($candidates.Count -gt 0) { $candidates[0].File.DirectoryName } else { Join-Path $env:USERPROFILE 'Downloads' }
-    $selected = Select-GgufWithDialog -InitialDirectory $initial
-    if (-not [string]::IsNullOrWhiteSpace($selected)) { return $selected }
-
-    throw "A HauHauCS GGUF model is required, but none could be selected. Rerun INSTALL.cmd and choose the model, or run install.ps1 -ModelPath 'C:\path\model.gguf'."
+    return Resolve-DefaultHauHau9BModel
 }
 
 function Find-RunningLlamaCommand {
@@ -600,18 +754,33 @@ function Find-RunningLlamaCommand {
 
 function Find-LlamaServerExecutable {
     param([AllowEmptyString()][string]$ExistingCommand)
+
+    $candidates = @()
     $fromCommand = Get-ExecutableFromCommandLine -CommandLine $ExistingCommand
-    if ($fromCommand -and (Test-Path -LiteralPath $fromCommand)) { return (Resolve-Path -LiteralPath $fromCommand).Path }
+    if ($fromCommand -and (Test-Path -LiteralPath $fromCommand)) {
+        $candidates += (Resolve-Path -LiteralPath $fromCommand).Path
+    }
 
     $pathCommand = Get-Command llama-server.exe -ErrorAction SilentlyContinue
-    if ($pathCommand -and (Test-Path -LiteralPath $pathCommand.Source)) { return $pathCommand.Source }
+    if ($pathCommand -and (Test-Path -LiteralPath $pathCommand.Source)) {
+        $candidates += [string]$pathCommand.Source
+    }
 
     $known = @(
         (Join-Path $RuntimeDir 'llama.cpp'),
         (Join-Path $env:LOCALAPPDATA 'Cinder_Alpha\runtime')
     )
-    $found = Find-FileRecursiveLimited -Roots $known -Filter 'llama-server.exe' | Select-Object -First 1
-    if ($found) { return $found.FullName }
+    $candidates += @(Find-FileRecursiveLimited -Roots $known -Filter 'llama-server.exe' | ForEach-Object { $_.FullName })
+
+    foreach ($candidate in @($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+        if (Test-CompatibleLlamaServer -Executable $candidate) {
+            return $candidate
+        }
+        $build = Get-LlamaBuildNumber -Executable $candidate
+        if ($build -gt 0) {
+            Write-Host "Ignoring llama.cpp build $build at $candidate; HauHauCS 9B requires build $($LlamaCppReleaseTag.TrimStart('b')) or newer."
+        }
+    }
     return ''
 }
 
@@ -637,6 +806,7 @@ function Install-LlamaCpp {
     }
     $exe = Get-ChildItem -LiteralPath $destination -Filter 'llama-server.exe' -File -Recurse | Select-Object -First 1
     if (-not $exe) { throw 'llama.cpp was downloaded, but llama-server.exe was not found after extraction.' }
+    Set-Content -LiteralPath (Join-Path $destination 'hauhau-build.txt') -Value $LlamaCppReleaseTag -Encoding ascii
     return $exe.FullName
 }
 
@@ -652,21 +822,26 @@ function Resolve-LlmCommandLine {
 
     $running = Find-RunningLlamaCommand
     if (-not [string]::IsNullOrWhiteSpace($running)) {
-        Write-Host 'Captured the running HauHau llama-server command on port 8080.'
-        return $running
+        $runningModel = Get-ModelFromCommandLine -CommandLine $running
+        $runningExe = Get-ExecutableFromCommandLine -CommandLine $running
+        if ($runningModel -and (Test-HauHau9BModel -Path $runningModel) -and $runningExe -and (Test-CompatibleLlamaServer -Executable $runningExe)) {
+            Write-Host 'Captured the running HauHauCS 9B llama-server command on port 8080.'
+            return $running
+        }
+        Write-Host 'A running llama-server uses a different model. It will be replaced with HauHauCS Qwen3.5 9B.'
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ExistingCommand)) {
         $existingExe = Get-ExecutableFromCommandLine -CommandLine $ExistingCommand
         $existingModel = Get-ModelFromCommandLine -CommandLine $ExistingCommand
-        $existingExeReady = ($existingExe -and (Test-Path -LiteralPath $existingExe)) -or ($existingExe -and (Get-Command $existingExe -ErrorAction SilentlyContinue))
-        $existingModelReady = $existingModel -and (Test-Path -LiteralPath $existingModel)
+        $existingExeReady = $existingExe -and (Test-Path -LiteralPath $existingExe) -and (Test-CompatibleLlamaServer -Executable $existingExe)
+        $existingModelReady = $existingModel -and (Test-HauHau9BModel -Path $existingModel)
         if ($existingExeReady -and $existingModelReady) {
-            Write-Host 'Keeping the existing HauHau llama-server command.'
+            Write-Host 'Keeping the verified HauHauCS Qwen3.5 9B llama-server command.'
             return $ExistingCommand
         }
-        if ([string]::IsNullOrWhiteSpace($RequestedModel)) {
-            $RequestedModel = $existingModel
+        if ($existingModel) {
+            Write-Host 'Existing LLM configuration targets a different model. Switching to HauHauCS Qwen3.5 9B.'
         }
     }
 
@@ -896,11 +1071,16 @@ try {
     if ($SelectedRuntime -eq 'Cpu') { $ttsCommand += ' --no-gpu' }
 
     $ttsPreloadedLiteral = if ($script:TtsModelsPreloaded) { '$true' } else { '$false' }
+    $finalLlmModelPath = Get-ModelFromCommandLine -CommandLine $FinalLlmCommand
+    $llmExpectedModelName = if ([string]::IsNullOrWhiteSpace($finalLlmModelPath)) { $LlmModelName } else { [IO.Path]::GetFileName($finalLlmModelPath) }
+    $llmExpectedMinimumBytes = if ($llmExpectedModelName -ieq $LlmModelName) { [long]$LlmModelMinimumBytes } else { 1MB }
     $config = @(
         '# HauHau Voice Stack for Windows configuration',
         '# Generated by install.ps1. The supervisor rewrites the LLM port to 8082.',
         ('$INSTALL_RUNTIME = {0}' -f (ConvertTo-PowerShellLiteral $SelectedRuntime)),
         ('$LLM_COMMAND_LINE = {0}' -f (ConvertTo-PowerShellLiteral $FinalLlmCommand)),
+        ('$LLM_EXPECTED_MODEL_NAME = {0}' -f (ConvertTo-PowerShellLiteral $llmExpectedModelName)),
+        ('$LLM_EXPECTED_MODEL_MINIMUM_BYTES = {0}' -f $llmExpectedMinimumBytes),
         ('$PYTHON_COMMAND_LINE = {0}' -f (ConvertTo-PowerShellLiteral $PythonCommandLine)),
         ('$TTS_START_COMMAND_LINE = {0}' -f (ConvertTo-PowerShellLiteral $ttsCommand)),
         '$TTS_STOP_COMMAND_LINE = ''''',
@@ -928,6 +1108,9 @@ try {
         crispasr_codec_model = if ($script:TtsModelsPreloaded) { $TtsCodecPath } else { '' }
         crispasr_voice_model = if ($script:TtsModelsPreloaded) { $TtsVoicePath } else { '' }
         llm_command = $FinalLlmCommand
+        llm_model_path = $finalLlmModelPath
+        llm_model_name = $llmExpectedModelName
+        llm_model_sha256 = if ($llmExpectedModelName -ieq $LlmModelName) { $LlmModelSha256 } else { '' }
     } | ConvertTo-Json -Depth 4
     Set-Content -LiteralPath (Join-Path $InstallDir 'dependencies.json') -Value $manifest -Encoding utf8
 
