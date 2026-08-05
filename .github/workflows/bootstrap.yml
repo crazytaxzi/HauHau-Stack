@@ -29,7 +29,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .bootstrap/part* | base64 --decode > /tmp/hauhau-stack.zip
+          cat \
+            .bootstrap/part000a \
+            .bootstrap/part000b \
+            .bootstrap/part001 \
+            .bootstrap/part002 \
+            .bootstrap/part003 \
+            .bootstrap/part004 \
+            .bootstrap/part005 \
+            | base64 --decode > /tmp/hauhau-stack.zip
+          echo '49f25cbd360c6f11fc24014d63220629850053e36b9d42d9d2c0d3ca6d479b55  /tmp/hauhau-stack.zip' | sha256sum --check
           unzip -t /tmp/hauhau-stack.zip
           rm -rf /tmp/hauhau-stack-source
           mkdir -p /tmp/hauhau-stack-source
