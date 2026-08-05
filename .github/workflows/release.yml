@@ -128,9 +128,11 @@ jobs:
           checksum_name = os.environ['RELEASE_CHECKSUM']
           commit = os.environ['GITHUB_SHA']
 
+          committed_blobs = {}
           for name in files:
-              if not pathlib.Path(name).is_file():
-                  raise SystemExit(f'missing package member: {name}')
+              committed_blobs[name] = subprocess.check_output(
+                  ['git', 'show', f'{commit}:{name}']
+              )
 
           with zipfile.ZipFile(
               zip_name,
@@ -139,7 +141,11 @@ jobs:
               compresslevel=9,
           ) as archive:
               for name in files:
-                  archive.write(name, arcname=name)
+                  info = zipfile.ZipInfo(name)
+                  info.date_time = (2026, 8, 5, 0, 0, 0)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  archive.writestr(info, committed_blobs[name], compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
 
           with zipfile.ZipFile(zip_name, mode='r') as archive:
               names = archive.namelist()
@@ -151,13 +157,7 @@ jobs:
 
               for name in files:
                   packaged = archive.read(name)
-                  working_tree = pathlib.Path(name).read_bytes()
-                  committed = subprocess.check_output(
-                      ['git', 'show', f'{commit}:{name}']
-                  )
-                  if packaged != working_tree:
-                      raise SystemExit(f'package differs from working tree: {name}')
-                  if packaged != committed:
+                  if packaged != committed_blobs[name]:
                       raise SystemExit(f'package differs from commit {commit}: {name}')
 
           digest = hashlib.sha256(pathlib.Path(zip_name).read_bytes()).hexdigest()
