@@ -1,0 +1,44 @@
+name: Fix 9B payload extractor
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/fix-apply.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-extractor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Correct marker matching and retrigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/apply-9b.yml')
+          text = path.read_text(encoding='utf-8')
+          old = "pattern = rf\"<<'{marker}'\\n(.*?)\\n{marker}\""
+          new = "pattern = rf\"<<'{marker}'\\r?\\n(.*?)\\r?\\n[ \\t]*{marker}(?:\\r?\\n|$)\""
+          if old not in text:
+              raise SystemExit('expected extractor pattern was not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
+
+          rm -f .github/workflows/fix-apply.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'Fix 9B payload marker matching'
+          git push origin HEAD:main
