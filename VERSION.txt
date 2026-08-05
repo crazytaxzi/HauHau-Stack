@@ -1,0 +1,4 @@
+HauHau Automatic Voice Stack for Windows
+Installer version: 3.0.4
+Compatible CrispASR: v0.8.25
+Compatible llama.cpp: b10280
