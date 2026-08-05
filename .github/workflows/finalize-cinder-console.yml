@@ -1,0 +1,215 @@
+name: Finalize Cinder Console
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/finalize-cinder-console.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hauhau-cinder-console-release
+  cancel-in-progress: false
+
+jobs:
+  verify-commit-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify and reconstruct Cinder Console
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/chunks.sha256 <<'EOF'
+          5e382b2f5da392289c7648958bfd56fb98c9f85548790c055792095d340cc1e8  .cinder-stage/part00
+          331af66a2e9d46234c6431ea074ffd67428250c777ff4e4740488d97981061a8  .cinder-stage/part01
+          bd19175db81aa3bbc7fd7f64d30c42450e4eddcc15e6f2c2fd62f8669555d5ab  .cinder-stage/part02
+          64f5e818d7f1a9a6875c49385e476fdba3e14cc612b549e23c2a5977d311371a  .cinder-stage/part03
+          b8f9e4f4620e53810478462a3085e9d48c5ed2e21eb028652f44cc81be5c3943  .cinder-stage/part04
+          eddd8a185910d300cd65b52278df944b0dd618a4dfd7055f7b0f12e959413964  .cinder-stage/part05
+          e5e54793e6835bb94e0c25f557ea07fd201e6ff7b649e421b7a96543e85717c5  .cinder-stage/part06
+          EOF
+          sed -i 's/^          //' /tmp/chunks.sha256
+          sha256sum --check /tmp/chunks.sha256
+
+          cat .cinder-stage/part00 .cinder-stage/part01 .cinder-stage/part02 \
+              .cinder-stage/part03 .cinder-stage/part04 .cinder-stage/part05 \
+              .cinder-stage/part06 > /tmp/voice_proxy.py.b64
+          base64 --decode /tmp/voice_proxy.py.b64 > voice_proxy.py
+          echo '3dcfe310d342814fe25027c47497a15be7f2ab02c337c5c7efaae619d6140ea0  voice_proxy.py' | sha256sum --check
+
+          cat > VERSION.txt <<'EOF'
+          HauHau Automatic Voice Stack for Windows
+          Installer version: 3.2.0
+          Default UI: Cinder Console 1.0.0
+          Default LLM: HauHauCS Qwen3.5 9B Q4_K_M
+          Compatible CrispASR: v0.8.25
+          Compatible llama.cpp: b10280
+          EOF
+          sed -i 's/^          //' VERSION.txt
+
+      - name: Validate Python, embedded UI, and local API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile voice_proxy.py
+          rm -rf __pycache__ ui
+
+          python voice_proxy.py \
+            --listen-host 127.0.0.1 \
+            --listen-port 18080 \
+            --backend-host 127.0.0.1 \
+            --backend-port 18082 \
+            --tts-host 127.0.0.1 \
+            --tts-port 19080 \
+            >/tmp/cinder-console.log 2>&1 &
+          proxy_pid=$!
+          trap 'kill "$proxy_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/ >/tmp/cinder-index.html; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          test "$ready" = 1
+
+          grep -q 'Cinder Console' /tmp/cinder-index.html
+          grep -q 'HauHau Voice Stack' /tmp/cinder-index.html
+          curl --fail --silent http://127.0.0.1:18080/ui/app.css >/tmp/cinder-app.css
+          curl --fail --silent http://127.0.0.1:18080/ui/app.js >/tmp/cinder-app.js
+          curl --fail --silent http://127.0.0.1:18080/api/status >/tmp/cinder-status.json
+          node --check /tmp/cinder-app.js
+          python -m json.tool /tmp/cinder-status.json >/dev/null
+          grep -q -- '--cinder-purple' /tmp/cinder-app.css
+          grep -q 'HauHauCS Qwen3.5 9B' /tmp/cinder-index.html
+
+          kill "$proxy_pid"
+          wait "$proxy_pid" 2>/dev/null || true
+          trap - EXIT
+          rm -rf __pycache__ ui
+
+      - name: Commit verified Cinder Console source
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add voice_proxy.py VERSION.txt
+          git commit -m 'Add stream-ready Cinder Console UI'
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build installer from committed source
+        id: package
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          files = [
+              'README.md', 'install.ps1', 'REPAIR_HAUHAU.cmd', 'INSTALL_CUDA.cmd',
+              'voice_proxy.py', 'uninstall.ps1', 'INSTALL_DEFER_TTS.cmd',
+              'hauhau-voice-stack.ps1', 'hauhau-voice-stack.cmd', 'config.example.ps1',
+              'CHECK_HAUHAU.cmd', 'INSTALL.cmd', 'STOP_HAUHAU.cmd',
+              'START_HAUHAU.cmd', 'VERSION.txt',
+          ]
+          commit = os.environ['RELEASE_COMMIT']
+          zip_name = 'hauhau_voice_stack_windows_installer_v3.2.0.zip'
+          checksum_name = zip_name + '.sha256'
+          blobs = {name: subprocess.check_output(['git', 'show', f'{commit}:{name}']) for name in files}
+
+          with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for name in files:
+                  archive.writestr(name, blobs[name])
+
+          with zipfile.ZipFile(zip_name, 'r') as archive:
+              if archive.namelist() != files:
+                  raise SystemExit(f'archive member mismatch: {archive.namelist()!r}')
+              bad = archive.testzip()
+              if bad is not None:
+                  raise SystemExit(f'archive CRC failed: {bad}')
+              for name in files:
+                  if archive.read(name) != blobs[name]:
+                      raise SystemExit(f'archive differs from commit for {name}')
+
+          digest = hashlib.sha256(pathlib.Path(zip_name).read_bytes()).hexdigest()
+          pathlib.Path(checksum_name).write_text(
+              f'{digest}  {zip_name}\n', encoding='ascii', newline='\n'
+          )
+          print(f'SHA256={digest}')
+          PY
+
+          sha256sum --check hauhau_voice_stack_windows_installer_v3.2.0.zip.sha256
+          echo 'zip=hauhau_voice_stack_windows_installer_v3.2.0.zip' >> "$GITHUB_OUTPUT"
+          echo 'checksum=hauhau_voice_stack_windows_installer_v3.2.0.zip.sha256' >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 hauhau_voice_stack_windows_installer_v3.2.0.zip.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish v3.2.0
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view v3.2.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release v3.2.0 already exists.' >&2
+            exit 1
+          fi
+
+          cat > /tmp/release-notes.md <<'EOF'
+          # HauHau Stack v3.2.0 — Cinder Console
+
+          Replaces the broken llama.cpp browser page with the stream-ready Cinder Console dashboard.
+
+          - Dark Cinder theme with electric purple, neon green, glass panels, embers, and custom mascot art
+          - Streaming local chat with Markdown, code blocks, copy, regenerate, history, and export
+          - Live HauHauCS Qwen3.5 9B model, GPU, VRAM, CPU, RAM, TTS, and service status
+          - Start, stop, restart, live logs, voice test, TTS toggle, and push-to-talk controls
+          - No npm, Electron, CDN, or external web assets; the complete UI is embedded in the Python proxy
+          - Existing install and repair flow remains intact
+          EOF
+
+          gh release create v3.2.0 \
+            '${{ steps.package.outputs.zip }}' \
+            '${{ steps.package.outputs.checksum }}' \
+            --repo "$GITHUB_REPOSITORY" \
+            --target '${{ steps.commit.outputs.sha }}' \
+            --title 'HauHau Stack v3.2.0 — Cinder Console' \
+            --notes-file /tmp/release-notes.md \
+            --latest
+
+      - name: Verify published release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release-verify
+          gh release download v3.2.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '${{ steps.package.outputs.zip }}' \
+            --pattern '${{ steps.package.outputs.checksum }}' \
+            --dir /tmp/release-verify
+          cd /tmp/release-verify
+          sha256sum --check '${{ steps.package.outputs.checksum }}'
+          test "$(sha256sum '${{ steps.package.outputs.zip }}' | cut -d' ' -f1)" = '${{ steps.package.outputs.sha256 }}'
+          gh release view v3.2.0 --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,assets,url
